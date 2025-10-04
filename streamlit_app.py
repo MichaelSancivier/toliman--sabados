@@ -68,12 +68,12 @@ def to_bool_series(s: pd.Series) -> pd.Series:
 
 def try_read_csv(file) -> pd.DataFrame:
     """
-    Robust loader:
-    - Detecta Excel (XLS/XLSX) e usa read_excel.
-    - Tenta encodings: utf-8/latin-1/cp1252 e usa chardet se disponível.
-    - Testa separadores: vírgula, ponto e vírgula, tab, pipe.
-    - Fallback com engine='python' e on_bad_lines='skip'.
+    Loader priorizando CSV com separador ';' e suportando XLSX.
+    - Se detectar XLSX (header 'PK'), usa read_excel.
+    - Para CSV: tenta encodings (utf-8, latin-1, cp1252, chardet) com sep=';'.
+    - Fallback: sep=';' + engine='python' + on_bad_lines='skip'.
     """
+    # ler bytes
     try:
         file.seek(0)
     except Exception:
@@ -89,7 +89,7 @@ def try_read_csv(file) -> pd.DataFrame:
     if raw is None:
         raise ValueError("Arquivo vazio.")
 
-    # XLSX (PK header)
+    # XLSX (ZIP header)
     if len(raw) >= 2 and raw[:2] == b"PK":
         try:
             import warnings
@@ -102,6 +102,7 @@ def try_read_csv(file) -> pd.DataFrame:
                 file.seek(0)
             except Exception:
                 pass
+            # continua para CSV
 
     encodings = ["utf-8", "latin-1", "cp1252"]
     try:
@@ -112,30 +113,31 @@ def try_read_csv(file) -> pd.DataFrame:
     except Exception:
         pass
 
-    seps = [",", ";", "\t", "|"]
+    # Tentar sempre com sep=';'
     for enc in encodings:
-        for sep in seps:
+        try:
+            from io import StringIO
+            txt = raw.decode(enc, errors="strict")
+            buf = StringIO(txt)
+            return pd.read_csv(buf, sep=";", engine="python")
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            # Ignorar linhas ruins
             try:
                 from io import StringIO
-                txt = raw.decode(enc, errors="strict")
+                txt = raw.decode(enc, errors="replace")
                 buf = StringIO(txt)
-                return pd.read_csv(buf, sep=sep, engine="python")
-            except UnicodeDecodeError:
-                continue
+                return pd.read_csv(buf, sep=";", engine="python", on_bad_lines="skip")
             except Exception:
-                try:
-                    from io import StringIO
-                    txt = raw.decode(enc, errors="replace")
-                    buf = StringIO(txt)
-                    return pd.read_csv(buf, sep=sep, engine="python", on_bad_lines="skip")
-                except Exception:
-                    continue
+                continue
 
+    # último recurso
     try:
         file.seek(0)
-        return pd.read_csv(file, engine="python", on_bad_lines="skip")
+        return pd.read_csv(file, sep=";", engine="python", on_bad_lines="skip")
     except Exception as e:
-        raise RuntimeError(f"Falha ao ler arquivo. Tente salvar como CSV UTF-8. Detalhes: {e}")
+        raise RuntimeError(f"Falha ao ler arquivo (sep=';'). Salve como CSV UTF-8 com ';'. Detalhes: {e}")
 
 def load_and_prepare(uploaded_files) -> Tuple[pd.DataFrame, List[str]]:
     logs = []
@@ -172,7 +174,7 @@ if df.empty:
     st.stop()
 
 # -----------------------------
-# Column detection
+# Column detection (inclui nomes exatos do seu arquivo)
 # -----------------------------
 col_cliente = find_col(df, ["cliente", "nome_cliente", "client", "customer"])
 col_placa   = find_col(df, ["placa", "placa_veiculo", "placas", "license_plate", "veiculo", "vehicle"])
@@ -199,13 +201,12 @@ with left:
     st.subheader("👤 Cliente")
     if col_cliente in df.columns:
         clientes = sorted([str(x) for x in df[col_cliente].dropna().unique()])
-        # selectbox com busca por digitação
         selected_cliente = st.selectbox("Selecione o cliente", ["(Todos)"] + clientes, index=0, placeholder="Digite para filtrar…")
     else:
         selected_cliente = "(Todos)"
         st.info("Nenhuma coluna de cliente detectada; operando sobre **todas** as linhas.")
 
-# presets por cliente via CSV/XLSX opcional
+# presets por cliente (opcional)
 preset_map = None
 if preset_file is not None:
     try:
@@ -237,7 +238,6 @@ def _get_preset_for(cliente: str):
 
 with right:
     st.subheader("🎯 Configuração desejada")
-    # defaults
     default_logoff_enabled = True
     default_bloq = True
     default_app_tempo = False
@@ -257,7 +257,6 @@ with right:
 # Filtrar por cliente (se selecionado)
 # -----------------------------
 if selected_cliente != "(Todos)" and col_cliente in df.columns:
-    # >>> correção: resetar índice após filtrar para alinhar as máscaras
     df = df[df[col_cliente].astype(str) == selected_cliente].copy().reset_index(drop=True)
 
 # -----------------------------
@@ -321,8 +320,13 @@ df_diff["ok_app_tempo"] = cmp_app[diff_mask].values
 k1, k2, k3 = st.columns(3)
 k1.metric("Total de linhas avaliadas", f"{len(df):,}".replace(",", "."))
 k2.metric("Placas divergentes (linhas)", f"{len(df_diff):,}".replace(",", "."))
-if col_placa in df_diff.columns:
-    k3.metric("Placas únicas divergentes", f"{df_diff[col_placa].nunique():,}".replace(",", "."))
+
+# Proteção quando não existe coluna de placa
+if col_placa and (col_placa in df_diff.columns):
+    placas_unicas = pd.Series(df_diff[col_placa].astype(str).str.strip()).nunique()
+    k3.metric("Placas únicas divergentes", f"{placas_unicas:,}".replace(",", "."))
+else:
+    k3.metric("Placas únicas divergentes", "—")
 
 # -----------------------------
 # Tabela
@@ -342,7 +346,7 @@ st.dataframe(df_diff, use_container_width=True, height=460)
 # -----------------------------
 def make_download(df: pd.DataFrame) -> Tuple[bytes, str]:
     out = io.StringIO()
-    df.to_csv(out, index=False)
+    df.to_csv(out, index=False, sep=";")
     b = out.getvalue().encode("utf-8")
     return b, f"placas_divergentes_{len(df)}_linhas.csv"
 
@@ -351,7 +355,7 @@ st.download_button("⬇️ Baixar lista de placas divergentes", data=csv_bytes, 
 
 with st.expander("ℹ️ Observações"):
     st.markdown(
-        "- **Cliente**: selectbox com busca. Após filtrar, os índices são resetados para evitar erros de máscara.\n"
-        "- **Comparação**: apenas 3 flags (sem tempo de logoff).\n"
-        "- Linhas sem informação suficiente aparecem como divergentes para revisão."
+        "- **Leitura**: prioriza CSV com `;` e suporta XLSX.\n"
+        "- **Cliente**: selectbox com busca. Após filtrar, índices são resetados (previne erros de máscara).\n"
+        "- **Comparação**: apenas 3 flags (Logoff, Bloqueio, App Tempo)."
     )
