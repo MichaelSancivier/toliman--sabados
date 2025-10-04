@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 import io
 import unicodedata
@@ -56,7 +55,8 @@ def to_bool(x):
         "y": True, "n": False,
         "on": True, "off": False,
         "ok": True, "nok": False,
-        "ativado": True, "ativar": True, "ativo": True, "desativado": False, "desativar": False, "inativo": False,
+        "ativado": True, "ativar": True, "ativo": True,
+        "desativado": False, "desativar": False, "inativo": False,
     }
     xs = _norm(str(x))
     return m.get(xs, np.nan)
@@ -67,6 +67,7 @@ def to_bool_series(s: pd.Series) -> pd.Series:
     return s.map(to_bool)
 
 def parse_seconds(val) -> Optional[float]:
+    """Accepts 12, 12.5 (segundos) or 'HH:MM:SS' / 'MM:SS'."""
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return None
     s = str(val).strip()
@@ -91,20 +92,81 @@ def parse_seconds(val) -> Optional[float]:
     return None
 
 def try_read_csv(file) -> pd.DataFrame:
-    for enc in ["utf-8", "latin-1", "cp1252"]:
+    """
+    Robust loader:
+    - Detecta Excel (XLS/XLSX) e usa read_excel.
+    - Tenta encodings: utf-8/latin-1/cp1252 e usa chardet se disponível.
+    - Testa separadores: vírgula, ponto e vírgula, tab, pipe.
+    - Fallback com engine='python' e on_bad_lines='skip'.
+    """
+    # pegar bytes do UploadedFile
+    try:
+        file.seek(0)
+    except Exception:
+        pass
+    try:
+        raw = file.read()
+    finally:
         try:
-            return pd.read_csv(file, encoding=enc)
+            file.seek(0)
+        except Exception:
+            pass
+
+    if raw is None:
+        raise ValueError("Arquivo vazio.")
+
+    # XLSX (ZIP: começa com 'PK')
+    if len(raw) >= 2 and raw[:2] == b"PK":
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                file.seek(0)
+                return pd.read_excel(file, engine="openpyxl")
         except Exception:
             try:
                 file.seek(0)
             except Exception:
                 pass
-            continue
+            # continua tentando CSV abaixo
+
+    # encodings
+    encodings = ["utf-8", "latin-1", "cp1252"]
     try:
-        file.seek(0)
+        import chardet
+        guess = chardet.detect(raw).get("encoding")
+        if guess and guess.lower() not in [e.lower() for e in encodings]:
+            encodings = [guess] + encodings
     except Exception:
         pass
-    return pd.read_csv(file)
+
+    # separadores
+    seps = [",", ";", "\t", "|"]
+    for enc in encodings:
+        for sep in seps:
+            try:
+                from io import StringIO
+                txt = raw.decode(enc, errors="strict")
+                buf = StringIO(txt)
+                return pd.read_csv(buf, sep=sep, engine="python")
+            except UnicodeDecodeError:
+                continue
+            except Exception:
+                # tenta ignorar linhas ruins
+                try:
+                    from io import StringIO
+                    txt = raw.decode(enc, errors="replace")
+                    buf = StringIO(txt)
+                    return pd.read_csv(buf, sep=sep, engine="python", on_bad_lines="skip")
+                except Exception:
+                    continue
+
+    # último recurso
+    try:
+        file.seek(0)
+        return pd.read_csv(file, engine="python", on_bad_lines="skip")
+    except Exception as e:
+        raise RuntimeError(f"Falha ao ler arquivo. Tente salvar como CSV UTF-8. Detalhes: {e}")
 
 def load_and_prepare(uploaded_files) -> Tuple[pd.DataFrame, List[str]]:
     logs = []
@@ -125,15 +187,19 @@ def load_and_prepare(uploaded_files) -> Tuple[pd.DataFrame, List[str]]:
 # Sidebar - Uploads
 # -----------------------------
 st.sidebar.header("📥 Arquivos")
-uploaded = st.sidebar.file_uploader("Envie 1 ou mais CSVs (telemetria/base)", type=["csv"], accept_multiple_files=True)
-preset_file = st.sidebar.file_uploader("Mapa de Configuração por Cliente (opcional)", type=["csv"], help="Colunas esperadas: cliente, logoff_enabled, logoff_seconds, bloqueio_ignicao, app_tempo_direcao")
+uploaded = st.sidebar.file_uploader("Envie 1 ou mais CSVs (ou XLSX)", type=["csv", "xlsx"], accept_multiple_files=True)
+preset_file = st.sidebar.file_uploader(
+    "Mapa de Configuração por Cliente (opcional)",
+    type=["csv", "xlsx"],
+    help="Colunas esperadas: cliente, logoff_enabled, logoff_seconds, bloqueio_ignicao, app_tempo_direcao"
+)
 
 df, load_logs = load_and_prepare(uploaded)
 for line in load_logs:
     st.sidebar.write(line)
 
 if df.empty:
-    st.info("Envie pelo menos um CSV para começar.")
+    st.info("Envie pelo menos um arquivo para começar.")
     st.stop()
 
 # -----------------------------
@@ -154,7 +220,7 @@ missing = [name for name, col in [
 ] if col is None]
 
 if missing:
-    st.warning("Colunas não encontradas automaticamente: **{}**. Ajuste os nomes no CSV se necessário.".format(", ".join(missing)))
+    st.warning("Colunas não encontradas automaticamente: **{}**. Ajuste os nomes no arquivo se necessário.".format(", ".join(missing)))
 
 # -----------------------------
 # Painel principal (Cliente + Configuração Alvo)
@@ -170,16 +236,19 @@ with left:
         selected_cliente = "(Todos)"
         st.info("Nenhuma coluna de cliente detectada; operando sobre **todas** as linhas.")
 
-# presets por cliente via CSV opcional
+# presets por cliente via CSV/XLSX opcional
 preset_map = None
 if preset_file is not None:
     try:
-        preset_df = try_read_csv(preset_file)
-        # normalizar nomes
+        # aceita csv e xlsx
+        if getattr(preset_file, "name", "").lower().endswith(".xlsx"):
+            preset_df = pd.read_excel(preset_file, engine="openpyxl")
+        else:
+            preset_df = try_read_csv(preset_file)
+
         req_cols = ["cliente", "logoff_enabled", "logoff_seconds", "bloqueio_ignicao", "app_tempo_direcao"]
-        ok = all(any(_norm(c)==_norm(x) for c in preset_df.columns) for x in req_cols)
+        ok = all(any(_norm(c) == _norm(x) for c in preset_df.columns) for x in req_cols)
         if ok:
-            # criar mapeamento com nomes normalizados
             colmap = {}
             for x in req_cols:
                 for c in preset_df.columns:
@@ -193,7 +262,6 @@ if preset_file is not None:
     except Exception as e:
         st.sidebar.error(f"Erro ao ler mapa de configuração: {e}")
 
-# estado inicial/ajustes da configuração alvo
 def _get_preset_for(cliente: str):
     if not preset_map or not cliente or cliente == "(Todos)":
         return None
@@ -210,13 +278,15 @@ with right:
     # aplica preset do cliente se existir
     preset = _get_preset_for(selected_cliente)
     if preset:
-        default_logoff_enabled = bool(to_bool(preset.get("logoff_enabled")) if "logoff_enabled" in preset else default_logoff_enabled)
-        default_logoff_seconds = int(preset.get("logoff_seconds")) if pd.notna(preset.get("logoff_seconds")) else default_logoff_seconds
-        default_bloq = bool(to_bool(preset.get("bloqueio_ignicao")) if "bloqueio_ignicao" in preset else default_bloq)
-        default_app_tempo = bool(to_bool(preset.get("app_tempo_direcao")) if "app_tempo_direcao" in preset else default_app_tempo)
+        default_logoff_enabled = bool(to_bool(preset.get("logoff_enabled"))) if "logoff_enabled" in preset else default_logoff_enabled
+        try:
+            default_logoff_seconds = int(preset.get("logoff_seconds"))
+        except Exception:
+            pass
+        default_bloq = bool(to_bool(preset.get("bloqueio_ignicao"))) if "bloqueio_ignicao" in preset else default_bloq
+        default_app_tempo = bool(to_bool(preset.get("app_tempo_direcao"))) if "app_tempo_direcao" in preset else default_app_tempo
         st.caption("Preset carregado a partir do mapa de configuração.")
 
-    # widgets
     target_logoff_enabled = st.selectbox("Logoff por ignição", ["Ativar", "Desativar"], index=0 if default_logoff_enabled else 1) == "Ativar"
     target_logoff_seconds  = st.number_input("Tempo do logoff (segundos)", min_value=0, value=int(default_logoff_seconds), step=5)
     tolerance_seconds = st.number_input("Tolerância do tempo (± seg.)", min_value=0, value=5, step=1)
@@ -363,9 +433,9 @@ st.download_button("⬇️ Baixar lista de placas divergentes", data=csv_bytes, 
 
 with st.expander("ℹ️ Observações"):
     st.markdown(
-        "- **Painel de Cliente**: selecione um cliente ou use (Todos). Opcionalmente, envie um CSV de **Mapa de Configuração** com presets por cliente.\n"
+        "- **Painel de Cliente**: selecione um cliente ou use (Todos). Opcionalmente, envie um CSV/XLSX de **Mapa de Configuração** com presets por cliente.\n"
         "- **Configuração desejada**: ajuste os campos à direita. Se existir preset, ele é aplicado automaticamente.\n"
-        "- Se o CSV não tiver coluna de **tempo do logoff**, a verificação usa apenas o **flag** (ativado/desativado).\n"
+        "- Se o arquivo não tiver coluna de **tempo do logoff**, a verificação usa apenas o **flag** (ativado/desativado).\n"
         "- Duração aceita números (segundos) e formatos `HH:MM:SS` / `MM:SS`.\n"
         "- Linhas sem informação suficiente também aparecem como divergentes para facilitar revisão."
     )
