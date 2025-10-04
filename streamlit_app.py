@@ -257,7 +257,8 @@ with right:
 # Filtrar por cliente (se selecionado)
 # -----------------------------
 if selected_cliente != "(Todos)" and col_cliente in df.columns:
-    df = df[df[col_cliente].astype(str) == selected_cliente].copy()
+    # >>> correção: resetar índice após filtrar para alinhar as máscaras
+    df = df[df[col_cliente].astype(str) == selected_cliente].copy().reset_index(drop=True)
 
 # -----------------------------
 # Normalize/parse columns (apenas flags)
@@ -350,7 +351,7 @@ st.download_button("⬇️ Baixar lista de placas divergentes", data=csv_bytes, 
 
 with st.expander("ℹ️ Observações"):
     st.markdown(
-        "- **Painel de Cliente**: selecione um cliente (campo com busca) ou use (Todos).\n"
-        "- **Configuração desejada**: agora compara **apenas** os 3 flags (sem tempo de logoff).\n"
-        "- Linhas sem informação suficiente também aparecem como divergentes para facilitar revisão."
+        "- **Cliente**: selectbox com busca. Após filtrar, os índices são resetados para evitar erros de máscara.\n"
+        "- **Comparação**: apenas 3 flags (sem tempo de logoff).\n"
+        "- Linhas sem informação suficiente aparecem como divergentes para revisão."
     )
