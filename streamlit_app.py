@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 # -----------------------------
-# Page setup
+# Configuração da página
 # -----------------------------
 st.set_page_config(
     page_title="Conferência de Configuração por Placa",
@@ -19,7 +19,7 @@ st.title("🧭 Conferência de Configuração por Placa")
 st.caption("Mostra as **placas** que estão **diferentes** da configuração solicitada pelo cliente (sem checar tempo de logoff).")
 
 # -----------------------------
-# Helpers
+# Funções auxiliares
 # -----------------------------
 def _norm(s: str) -> str:
     if s is None:
@@ -33,7 +33,6 @@ def _norm(s: str) -> str:
     return s
 
 def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Find first matching column (case/accents-insensitive). Returns actual df column name."""
     norm_map = {_norm(c): c for c in df.columns}
     for cand in candidates:
         k = _norm(cand)
@@ -52,7 +51,6 @@ def to_bool(x):
         "1": True, "0": False,
         "true": True, "false": False,
         "sim": True, "nao": False, "não": False,
-        "y": True, "n": False,
         "on": True, "off": False,
         "ok": True, "nok": False,
         "ativado": True, "ativar": True, "ativo": True,
@@ -67,29 +65,17 @@ def to_bool_series(s: pd.Series) -> pd.Series:
     return s.map(to_bool)
 
 def try_read_csv(file) -> pd.DataFrame:
-    """
-    Loader priorizando CSV com separador ';' e suportando XLSX.
-    - Se detectar XLSX (header 'PK'), usa read_excel.
-    - Para CSV: tenta encodings (utf-8, latin-1, cp1252, chardet) com sep=';'.
-    - Fallback: sep=';' + engine='python' + on_bad_lines='skip'.
-    """
-    # ler bytes
+    """Lê CSVs com separador ';' ou XLSX automaticamente."""
     try:
         file.seek(0)
     except Exception:
         pass
+    raw = file.read()
     try:
-        raw = file.read()
-    finally:
-        try:
-            file.seek(0)
-        except Exception:
-            pass
+        file.seek(0)
+    except Exception:
+        pass
 
-    if raw is None:
-        raise ValueError("Arquivo vazio.")
-
-    # XLSX (ZIP header)
     if len(raw) >= 2 and raw[:2] == b"PK":
         try:
             import warnings
@@ -98,56 +84,28 @@ def try_read_csv(file) -> pd.DataFrame:
                 file.seek(0)
                 return pd.read_excel(file, engine="openpyxl")
         except Exception:
-            try:
-                file.seek(0)
-            except Exception:
-                pass
-            # continua para CSV
+            pass
 
     encodings = ["utf-8", "latin-1", "cp1252"]
-    try:
-        import chardet
-        guess = chardet.detect(raw).get("encoding")
-        if guess and guess.lower() not in [e.lower() for e in encodings]:
-            encodings = [guess] + encodings
-    except Exception:
-        pass
-
-    # Tentar sempre com sep=';'
     for enc in encodings:
         try:
             from io import StringIO
-            txt = raw.decode(enc, errors="strict")
+            txt = raw.decode(enc, errors="replace")
             buf = StringIO(txt)
-            return pd.read_csv(buf, sep=";", engine="python")
-        except UnicodeDecodeError:
-            continue
+            return pd.read_csv(buf, sep=";", engine="python", on_bad_lines="skip")
         except Exception:
-            # Ignorar linhas ruins
-            try:
-                from io import StringIO
-                txt = raw.decode(enc, errors="replace")
-                buf = StringIO(txt)
-                return pd.read_csv(buf, sep=";", engine="python", on_bad_lines="skip")
-            except Exception:
-                continue
+            continue
 
-    # último recurso
-    try:
-        file.seek(0)
-        return pd.read_csv(file, sep=";", engine="python", on_bad_lines="skip")
-    except Exception as e:
-        raise RuntimeError(f"Falha ao ler arquivo (sep=';'). Salve como CSV UTF-8 com ';'. Detalhes: {e}")
+    raise RuntimeError("Falha ao ler arquivo. Verifique se é CSV com ';' ou XLSX válido.")
 
 def load_and_prepare(uploaded_files) -> Tuple[pd.DataFrame, List[str]]:
-    logs = []
-    dfs = []
+    logs, dfs = [], []
     for up in uploaded_files:
         if up is None:
             continue
         df = try_read_csv(up)
         df["fonte"] = getattr(up, "name", "arquivo")
-        logs.append(f"✅ Carregado: {getattr(up, 'name', 'arquivo')}  - {df.shape[0]} linhas, {df.shape[1]} colunas")
+        logs.append(f"✅ {getattr(up, 'name', 'arquivo')}  - {df.shape[0]} linhas, {df.shape[1]} colunas")
         dfs.append(df)
     if not dfs:
         return pd.DataFrame(), logs
@@ -155,14 +113,11 @@ def load_and_prepare(uploaded_files) -> Tuple[pd.DataFrame, List[str]]:
     return df_all, logs
 
 # -----------------------------
-# Sidebar - Uploads
+# Upload
 # -----------------------------
 st.sidebar.header("📥 Arquivos")
-uploaded = st.sidebar.file_uploader("Envie 1 ou mais CSVs (ou XLSX)", type=["csv", "xlsx"], accept_multiple_files=True)
-preset_file = st.sidebar.file_uploader(
-    "Mapa de Configuração por Cliente (opcional)",
-    type=["csv", "xlsx"],
-    help="Colunas esperadas: cliente, logoff_enabled, bloqueio_ignicao, app_tempo_direcao"
+uploaded = st.sidebar.file_uploader(
+    "Envie 1 ou mais CSVs (ou XLSX)", type=["csv", "xlsx"], accept_multiple_files=True
 )
 
 df, load_logs = load_and_prepare(uploaded)
@@ -174,7 +129,7 @@ if df.empty:
     st.stop()
 
 # -----------------------------
-# Column detection (inclui nomes exatos do seu arquivo)
+# Identificação das colunas
 # -----------------------------
 col_cliente = find_col(df, ["cliente", "nome_cliente", "client", "customer"])
 col_placa   = find_col(df, ["placa", "placa_veiculo", "placas", "license_plate", "veiculo", "vehicle"])
@@ -182,18 +137,8 @@ col_logoff  = find_col(df, ["logoff_ignicao", "logoff_ignição", "logoff"])
 col_tempo   = find_col(df, ["app_tempo_direcao", "app_tempo_direção", "tempo_direcao_app", "app_tempodirecao", "tempo_direcao"])
 col_bloq    = find_col(df, ["bloqueio_ignicao", "bloqueio_ignição", "ignicao_bloqueio", "bloqueioignicao", "bloq_ignicao"])
 
-missing = [name for name, col in [
-    ("Placa", col_placa),
-    ("Logoff_Ignição (flag)", col_logoff),
-    ("Bloqueio_Ignição", col_bloq),
-    ("App_Tempo_Direção", col_tempo),
-] if col is None]
-
-if missing:
-    st.warning("Colunas não encontradas automaticamente: **{}**. Ajuste os nomes no arquivo se necessário.".format(", ".join(missing)))
-
 # -----------------------------
-# Painel principal (Cliente + Configuração Alvo)
+# Painel principal
 # -----------------------------
 left, right = st.columns([1,1])
 
@@ -206,113 +151,44 @@ with left:
         selected_cliente = "(Todos)"
         st.info("Nenhuma coluna de cliente detectada; operando sobre **todas** as linhas.")
 
-# presets por cliente (opcional)
-preset_map = None
-if preset_file is not None:
-    try:
-        if getattr(preset_file, "name", "").lower().endswith(".xlsx"):
-            preset_df = pd.read_excel(preset_file, engine="openpyxl")
-        else:
-            preset_df = try_read_csv(preset_file)
-
-        req_cols = ["cliente", "logoff_enabled", "bloqueio_ignicao", "app_tempo_direcao"]
-        ok = all(any(_norm(c) == _norm(x) for c in preset_df.columns) for x in req_cols)
-        if ok:
-            colmap = {}
-            for x in req_cols:
-                for c in preset_df.columns:
-                    if _norm(c) == _norm(x):
-                        colmap[x] = c
-                        break
-            preset_df = preset_df.rename(columns=colmap)
-            preset_map = preset_df.set_index("cliente").to_dict(orient="index")
-        else:
-            st.sidebar.warning("Mapa de configuração: colunas esperadas não encontradas. Esperado: " + ", ".join(req_cols))
-    except Exception as e:
-        st.sidebar.error(f"Erro ao ler mapa de configuração: {e}")
-
-def _get_preset_for(cliente: str):
-    if not preset_map or not cliente or cliente == "(Todos)":
-        return None
-    return preset_map.get(cliente)
-
 with right:
     st.subheader("🎯 Configuração desejada")
-    default_logoff_enabled = True
-    default_bloq = True
-    default_app_tempo = False
-
-    preset = _get_preset_for(selected_cliente)
-    if preset:
-        default_logoff_enabled = bool(to_bool(preset.get("logoff_enabled"))) if "logoff_enabled" in preset else default_logoff_enabled
-        default_bloq = bool(to_bool(preset.get("bloqueio_ignicao"))) if "bloqueio_ignicao" in preset else default_bloq
-        default_app_tempo = bool(to_bool(preset.get("app_tempo_direcao"))) if "app_tempo_direcao" in preset else default_app_tempo
-        st.caption("Preset carregado a partir do mapa de configuração.")
-
-    target_logoff_enabled = st.selectbox("Logoff por ignição", ["Ativar", "Desativar"], index=0 if default_logoff_enabled else 1) == "Ativar"
-    target_bloq = st.selectbox("Bloqueio por ignição", ["Ativar", "Desativar"], index=0 if default_bloq else 1) == "Ativar"
-    target_app_tempo = st.selectbox("App Tempo de Direção", ["Ativar", "Desativar"], index=0 if default_app_tempo else 1) == "Ativar"
+    target_logoff_enabled = st.selectbox("Logoff por ignição", ["Ativar", "Desativar"], index=0) == "Ativar"
+    target_bloq = st.selectbox("Bloqueio por ignição", ["Ativar", "Desativar"], index=0) == "Ativar"
+    target_app_tempo = st.selectbox("App Tempo de Direção", ["Ativar", "Desativar"], index=1) == "Ativar"
 
 # -----------------------------
-# Filtrar por cliente (se selecionado)
+# Filtrar cliente
 # -----------------------------
 if selected_cliente != "(Todos)" and col_cliente in df.columns:
     df = df[df[col_cliente].astype(str) == selected_cliente].copy().reset_index(drop=True)
 
 # -----------------------------
-# Normalize/parse columns (apenas flags)
+# Normalizar colunas e comparar
 # -----------------------------
 logoff_flag = to_bool_series(df[col_logoff]) if col_logoff in df.columns else pd.Series([np.nan]*len(df))
 bloq_flag   = to_bool_series(df[col_bloq])   if col_bloq   in df.columns else pd.Series([np.nan]*len(df))
 app_flag    = to_bool_series(df[col_tempo])  if col_tempo  in df.columns else pd.Series([np.nan]*len(df))
 
-# -----------------------------
-# Comparações (somente 3 flags)
-# -----------------------------
 def equals_bool(a, b):
     if pd.isna(a):
         return np.nan
     return bool(a) == bool(b)
 
-desired = {
-    "logoff_ativo": target_logoff_enabled,
-    "bloqueio_ignicao": target_bloq,
-    "app_tempo_direcao_ativo": target_app_tempo,
-}
+cmp_logoff = logoff_flag.map(lambda x: equals_bool(x, target_logoff_enabled))
+cmp_bloq   = bloq_flag.map(lambda x: equals_bool(x, target_bloq))
+cmp_app    = app_flag.map(lambda x: equals_bool(x, target_app_tempo))
 
-cmp_logoff = logoff_flag.map(lambda x: equals_bool(x, desired["logoff_ativo"]))
-cmp_bloq   = bloq_flag.map(lambda x: equals_bool(x, desired["bloqueio_ignicao"]))
-cmp_app    = app_flag.map(lambda x: equals_bool(x, desired["app_tempo_direcao_ativo"]))
-
-def row_ok(i):
-    vals = []
-    if not pd.isna(cmp_logoff.iat[i]): vals.append(bool(cmp_logoff.iat[i]))
-    if not pd.isna(cmp_bloq.iat[i]):   vals.append(bool(cmp_bloq.iat[i]))
-    if not pd.isna(cmp_app.iat[i]):    vals.append(bool(cmp_app.iat[i]))
-    if not vals:
-        return False
-    return all(vals)
-
-ok_mask = pd.Series([row_ok(i) for i in range(len(df))])
+ok_mask = (cmp_logoff & cmp_bloq & cmp_app).fillna(False)
 diff_mask = ~ok_mask
 
 # -----------------------------
-# Resultados: apenas placas divergentes
+# Resultados
 # -----------------------------
-out_cols = []
-if col_placa in df.columns: out_cols.append(col_placa)
-if col_cliente in df.columns: out_cols.append(col_cliente)
-for c in [col_logoff, col_bloq, col_tempo, "fonte"]:
-    if c in df.columns:
-        out_cols.append(c)
-
+cols = [c for c in [col_placa, col_cliente, col_logoff, col_bloq, col_tempo, "fonte"] if c in df.columns]
 df_diff = df[diff_mask].copy()
-if out_cols:
-    df_diff = df_diff[out_cols]
-
-df_diff["ok_logoff"] = cmp_logoff[diff_mask].values
-df_diff["ok_bloqueio"] = cmp_bloq[diff_mask].values
-df_diff["ok_app_tempo"] = cmp_app[diff_mask].values
+if cols:
+    df_diff = df_diff[cols]
 
 # -----------------------------
 # KPIs
@@ -320,42 +196,31 @@ df_diff["ok_app_tempo"] = cmp_app[diff_mask].values
 k1, k2, k3 = st.columns(3)
 k1.metric("Total de linhas avaliadas", f"{len(df):,}".replace(",", "."))
 k2.metric("Placas divergentes (linhas)", f"{len(df_diff):,}".replace(",", "."))
-
-# Proteção quando não existe coluna de placa
 if col_placa and (col_placa in df_diff.columns):
-    placas_unicas = pd.Series(df_diff[col_placa].astype(str).str.strip()).nunique()
-    k3.metric("Placas únicas divergentes", f"{placas_unicas:,}".replace(",", "."))
+    k3.metric("Placas únicas divergentes", f"{df_diff[col_placa].nunique():,}".replace(",", "."))
 else:
     k3.metric("Placas únicas divergentes", "—")
 
 # -----------------------------
-# Tabela
+# Exibir tabela
 # -----------------------------
 st.subheader("Placas com configuração divergente")
-st.write("Cliente: **{}** | Configuração alvo: **Logoff** = {}, **Bloqueio** = {}, **App Tempo Direção** = {}.".format(
-    selected_cliente,
-    "Ativo" if desired["logoff_ativo"] else "Inativo",
-    "Ativo" if desired["bloqueio_ignicao"] else "Inativo",
-    "Ativo" if desired["app_tempo_direcao_ativo"] else "Inativo",
-))
-
 st.dataframe(df_diff, use_container_width=True, height=460)
 
 # -----------------------------
-# Download
+# Download CSV
 # -----------------------------
 def make_download(df: pd.DataFrame) -> Tuple[bytes, str]:
     out = io.StringIO()
     df.to_csv(out, index=False, sep=";")
-    b = out.getvalue().encode("utf-8")
-    return b, f"placas_divergentes_{len(df)}_linhas.csv"
+    return out.getvalue().encode("utf-8"), f"placas_divergentes_{len(df)}_linhas.csv"
 
 csv_bytes, fname = make_download(df_diff)
 st.download_button("⬇️ Baixar lista de placas divergentes", data=csv_bytes, file_name=fname, mime="text/csv")
 
 with st.expander("ℹ️ Observações"):
     st.markdown(
-        "- **Leitura**: prioriza CSV com `;` e suporta XLSX.\n"
-        "- **Cliente**: selectbox com busca. Após filtrar, índices são resetados (previne erros de máscara).\n"
-        "- **Comparação**: apenas 3 flags (Logoff, Bloqueio, App Tempo)."
+        "- Agora **sem mapa de configuração** — basta ajustar as 3 opções à direita.\n"
+        "- Aceita **CSV com `;`** ou **Excel (.xlsx)**.\n"
+        "- Clientes com colunas faltando são exibidos como divergentes."
     )
